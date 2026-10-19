@@ -1,0 +1,174 @@
+name: AI Korean Article - Review Draft
+
+# Manual test only: no automatic spending until you enable a schedule.
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: 'Draft topic in Korean (leave blank for a preset topic)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: marginpilot-draft
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write one article using OpenAI Responses API
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          USER_TOPIC: ${{ inputs.topic }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import html
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import urllib.request
+          import urllib.error
+
+          key = os.environ.get('OPENAI_API_KEY', '')
+          if not key.startswith('sk-'):
+              sys.exit('OPENAI_API_KEY is missing. Check repository Secrets > Actions.')
+          now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+          topics = [
+              '온라인 상품 판매가의 손익분기점 계산 방법',
+              '중고거래 판매 희망가와 실제 체결가를 구분하는 방법',
+              '무료배송 상품의 판매자 부담 배송비 계산',
+              '반품과 불량 비용을 고려한 온라인 판매 순이익',
+              '재고 회전율이 적은 마진을 잠식하는 이유',
+              '온라인 판매 수수료와 광고비를 나누어 계산하는 방법',
+          ]
+          topic = (os.environ.get('USER_TOPIC') or '').strip()[:90]
+          if not topic:
+              topic = topics[now.timetuple().tm_yday % len(topics)]
+
+          schema = {
+              'type': 'object',
+              'properties': {
+                  'title': {'type': 'string'},
+                  'intro': {'type': 'string'},
+                  'sections': {
+                      'type': 'array',
+                      'items': {
+                          'type': 'object',
+                          'properties': {
+                              'heading': {'type': 'string'},
+                              'body': {'type': 'string'},
+                          },
+                          'required': ['heading', 'body'],
+                          'additionalProperties': False,
+                      },
+                  },
+                  'closing': {'type': 'string'},
+              },
+              'required': ['title', 'intro', 'sections', 'closing'],
+              'additionalProperties': False,
+          }
+          payload = {
+              'model': 'gpt-4.1-mini',
+              'store': False,
+              'max_output_tokens': 1200,
+              'input': [
+                  {
+                      'role': 'system',
+                      'content': ('당신은 한국 온라인 판매자를 위한 실용적인 교육 콘텐츠 작성자입니다. '
+                                  '객관적으로 검증되지 않은 실시간 가격·거래량·통계·수익·법률 요건을 만들지 마세요. '
+                                  '출처가 없는 숫자와 광고성 문구를 쓰지 마세요. '
+                                  '상품·투자 구매를 부추기지 말고 독자에게 계산법과 주의사항을 설명하세요. '
+                                  '콘텐츠는 한국어로, 제목과 3~4개의 짧은 문단 섹션, 핵심 결론으로 구성하세요. '
+                                  '제시한 내용은 검수 전 게시되지 않는 초안입니다.'),
+                  },
+                  {
+                      'role': 'user',
+                      'content': f'주제: {topic}. 독창적인 실무 팁과 검증 질문을 담은 한국어 글을 써 주세요.',
+                  },
+              ],
+              'text': {
+                  'format': {
+                      'type': 'json_schema',
+                      'name': 'marginpilot_review_draft',
+                      'strict': True,
+                      'schema': schema,
+                  },
+              },
+          }
+          req = urllib.request.Request(
+              'https://api.openai.com/v1/responses',
+              data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+              headers={
+                  'Authorization': 'Bearer ' + key,
+                  'Content-Type': 'application/json',
+              },
+              method='POST',
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=65) as response:
+                  answer = json.load(response)
+          except urllib.error.HTTPError as error:
+              # Avoid echoing full API error bodies (which might contain sensitive metadata).
+              sys.exit(f'OpenAI request failed (HTTP {error.code}). Check API credit/billing and model access.')
+          except Exception as error:
+              sys.exit('OpenAI request failed; check Actions network or API availability: ' + type(error).__name__)
+
+          if answer.get('status') != 'completed':
+              sys.exit('AI response was not completed. Check token budget or API access.')
+          text_parts = [
+              part.get('text', '')
+              for message in answer.get('output', [])
+              if message.get('type') == 'message'
+              for part in message.get('content', [])
+              if part.get('type') == 'output_text'
+          ]
+          if not text_parts:
+              sys.exit('AI generated no usable text.')
+          article = json.loads(''.join(text_parts))
+          if not (3 <= len(article['sections']) <= 5):
+              sys.exit('Article did not meet the structure check; nothing published.')
+          if len(article['title']) > 95 or len(article['intro']) < 25:
+              sys.exit('Article failed basic length checks; nothing published.')
+          escape = html.escape
+          sections = '\n'.join(
+              '<section><h2>' + escape(s['heading']) + '</h2><p>' + escape(s['body']).replace('\n', '<br>') + '</p></section>'
+              for s in article['sections']
+          )
+          date = now.strftime('%Y-%m-%d')
+          page = '''<!doctype html><html lang="ko"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <meta name="robots" content="noindex,nofollow">
+          <title>''' + escape(article['title']) + ''' | 마진파일럿 초안</title>
+          <style>body{max-width:780px;margin:40px auto;padding:0 20px;font:16px/1.9 system-ui,-apple-system,sans-serif;color:#26363a}h1{line-height:1.35}h2{margin-top:35px}small,.note{color:#54635c}.note{padding:12px 15px;background:#eaf7eb;border-radius:10px}a{color:#176a45}</style></head><body>
+          <a href="https://saymyname90.github.io/marginpilot-site/">마진파일럿</a>
+          <p class="note"><strong>검수 전 초안 · 아직 사이트에 게시되지 않음</strong><br>AI 작성. 수치·표현·근거를 확인한 뒤 게시하세요.</p>
+          <small>초안 작성: ''' + date + '''</small>
+          <h1>''' + escape(article['title']) + '''</h1>
+          <p>''' + escape(article['intro']).replace('\n', '<br>') + '''</p>
+          ''' + sections + '''
+          <h2>핵심 정리</h2><p>''' + escape(article['closing']) + '''</p>
+          <p><small>본 문서는 학습·검토용 초안이며 재무·세무·법률 자문이 아닙니다.</small></p></body></html>'''
+          dest = Path('draft-output')
+          dest.mkdir(parents=True, exist_ok=True)
+          (dest / 'review-draft.html').write_text(page, encoding='utf-8')
+          (dest / 'README.txt').write_text(
+              '마진파일럿 AI 글 초안\n주제: ' + topic + '\n작성일: ' + date +
+              '\n검수 후 게시하세요. 본 파일은 GitHub Pages에 자동 게시되지 않습니다.\n',
+              encoding='utf-8',
+          )
+          print('Draft ready for review; no website changes made.')
+          PY
+      - name: Downloadable review draft
+        uses: actions/upload-artifact@v4
+        with:
+          name: marginpilot-review-draft
+          path: draft-output/
+          retention-days: 7
